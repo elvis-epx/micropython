@@ -139,6 +139,7 @@ STATIC mp_obj_t get_lan(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_ar
 
     if (args[ARG_phy_type].u_int != PHY_LAN8710 &&
         args[ARG_phy_type].u_int != PHY_LAN8720 &&
+        args[ARG_phy_type].u_int != PHY_JL1101 &&
         args[ARG_phy_type].u_int != PHY_IP101 &&
         args[ARG_phy_type].u_int != PHY_RTL8201 &&
         args[ARG_phy_type].u_int != PHY_KSZ8041 &&
@@ -200,6 +201,9 @@ STATIC mp_obj_t get_lan(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_ar
             break;
         case PHY_IP101:
             self->phy = esp_eth_phy_new_ip101(&phy_config);
+            break;
+        case PHY_JL1101:
+            self->phy = esp_eth_phy_new_jl1101(&phy_config);
             break;
         case PHY_RTL8201:
             self->phy = esp_eth_phy_new_rtl8201(&phy_config);

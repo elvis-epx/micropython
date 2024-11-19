@@ -96,7 +96,6 @@ list(APPEND MICROPY_SOURCE_PORT
     mphalport.c
     fatfs_port.c
     help.c
-    machine_bitstream.c
     machine_timer.c
     machine_pin.c
     machine_touchpad.c
@@ -112,7 +111,6 @@ list(APPEND MICROPY_SOURCE_PORT
     modesp.c
     esp32_nvs.c
     esp32_partition.c
-    esp32_rmt.c
     esp32_rmt2.c
     esp32_ulp.c
     modesp32.c

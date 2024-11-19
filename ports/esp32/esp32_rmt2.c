@@ -33,10 +33,31 @@ static rmt_rx_channel_config_t rx_ch_conf = {
     .mem_block_symbols = 64,
 };
 
+static mp_obj_t rmt_recv_done_upperhalf(mp_obj_t _) {
+    // FIXME handle
+    size_t len = rx_data.num_symbols;
+    mp_printf(MP_PYTHON_PRINTER, "RMT2 tot=%u ", len);
+    rmt_symbol_word_t *data = rx_data.received_symbols;
+    for (uint8_t i = 0; i < len; i++) {
+        int n0 = (uint16_t) data[i].duration0;
+        int n1 = (uint16_t) data[i].duration1;
+        if (!data[i].level0) {
+            n0 = -n0;
+        }
+        if (!data[i].level1) {
+            n1 = -n1;
+        }
+        mp_printf(MP_PYTHON_PRINTER, "%d %d ", n0, n1);
+    }
+    mp_printf(MP_PYTHON_PRINTER, "\n");
+    return mp_const_none;
+}
+
+static MP_DEFINE_CONST_FUN_OBJ_1(rmt_recv_done_upperhalf_obj, rmt_recv_done_upperhalf);
 
 static bool IRAM_ATTR rmt_recv_done(rmt_channel_handle_t channel, const rmt_rx_done_event_data_t *edata, void *udata){
-    // FIXME handle
     rx_data = *edata;
+    mp_sched_schedule(MP_OBJ_FROM_PTR(&rmt_recv_done_upperhalf_obj), mp_const_none);
     return false;
 }
 

@@ -15,6 +15,7 @@ extern const mp_obj_type_t esp32_rmt2_type;
 typedef struct _esp32_rmt2_obj_t {
     mp_obj_base_t base;
     gpio_num_t pin;
+    bool continue_rx;
 } esp32_rmt2_obj_t;
 
 static rmt_channel_handle_t rx_channel = NULL;
@@ -57,18 +58,22 @@ static MP_DEFINE_CONST_FUN_OBJ_1(rmt_recv_done_upperhalf_obj, rmt_recv_done_uppe
 
 static bool IRAM_ATTR rmt_recv_done(rmt_channel_handle_t channel, const rmt_rx_done_event_data_t *edata, void *udata){
     rx_data = *edata;
+    esp32_rmt2_obj_t *self = udata;
     mp_sched_schedule(MP_OBJ_FROM_PTR(&rmt_recv_done_upperhalf_obj), mp_const_none);
+    if (self->continue_rx) {
+        rmt_receive(rx_channel, symbols, sizeof(symbols), &rx_config);
+    }
     return false;
 }
 
 
-static esp_err_t rmt_do_install()
+static esp_err_t rmt_do_install(void *self)
 {
     rmt_new_rx_channel(&rx_ch_conf, &rx_channel);
     rmt_rx_event_callbacks_t cbs = {
         .on_recv_done = rmt_recv_done,
     };
-    rmt_rx_register_event_callbacks(rx_channel, &cbs, NULL);
+    rmt_rx_register_event_callbacks(rx_channel, &cbs, self);
     return rmt_enable(rx_channel);
 }
 
@@ -84,7 +89,7 @@ static mp_obj_t esp32_rmt2_make_new(const mp_obj_type_t *type, size_t n_args, si
     esp32_rmt2_obj_t *self = mp_obj_malloc_with_finaliser(esp32_rmt2_obj_t, &esp32_rmt2_type);
     rx_ch_conf.gpio_num = self->pin = pin_id;
 
-    check_esp_err(rmt_do_install());
+    check_esp_err(rmt_do_install(self));
     rx_data.num_symbols = 0;
 
     return MP_OBJ_FROM_PTR(self);
@@ -111,17 +116,17 @@ static MP_DEFINE_CONST_FUN_OBJ_1(esp32_rmt2_deinit_obj, esp32_rmt2_deinit);
 
 
 static mp_obj_t esp32_rmt2_stop_read_pulses(mp_obj_t self_in) {
-    // esp32_rmt2_obj_t *self = MP_OBJ_TO_PTR(self_in);
-
-    esp_err_t err = rmt_disable(rx_channel);
-    rx_data.num_symbols = 0;
-    return err == ESP_OK ? mp_const_true : mp_const_false;
+    esp32_rmt2_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    bool ret = self->continue_rx;
+    self->continue_rx = false;
+    return ret ? mp_const_true : mp_const_false;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(esp32_rmt2_stop_read_pulses_obj, esp32_rmt2_stop_read_pulses);
 
 
 static mp_obj_t esp32_rmt2_read_pulses(mp_obj_t self_in) {
-    // esp32_rmt2_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    esp32_rmt2_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    self->continue_rx = true;
 
     rx_data.num_symbols = 0;
     check_esp_err(rmt_receive(rx_channel, symbols, sizeof(symbols), &rx_config));

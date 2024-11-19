@@ -6,6 +6,23 @@
 #include "esp_task.h"
 #include "driver/rmt_rx.h"
 
+/*
+import machine, esp32
+p = machine.Pin(14)
+
+total = 0
+totalb = 0
+
+def cb(l):
+    global total, totalb
+    total += 1
+    totalb += len(l)
+    print(len(l), l)
+
+r = esp32.RMT2(pin=p, cb=cb)
+r.read_pulses()
+*/
+
 void machine_bitstream_high_low(mp_hal_pin_obj_t pin, uint32_t *timing_ns, const uint8_t *buf, size_t len) {
 }
 

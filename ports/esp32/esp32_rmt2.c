@@ -46,40 +46,24 @@ typedef struct _esp32_rmt2_obj_t {
 
     // double buffering of received data
     bool recv_locked;
-    size_t recv_num_symbols;
-    rmt_symbol_word_t *recv_symbols;
+    size_t recv_count;
+    int *recv_data;
 } esp32_rmt2_obj_t;
 
 // Non-public function called by interrupt handler to finish data processing
 static mp_obj_t rmt_recv_done_upperhalf(mp_obj_t self_in) {
     esp32_rmt2_obj_t *self = MP_OBJ_TO_PTR(self_in);
 
-    if (self->cb == mp_const_none || !self->continue_rx) {
+    if (self->cb == mp_const_none || !self->continue_rx || self->recv_count == 0) {
         self->recv_locked = false;
         return mp_const_none;
     }
 
-    // convert RMT samples to list
-    size_t len = self->recv_num_symbols;
-    const rmt_symbol_word_t *data = self->recv_symbols;
-
-    int odd = (data[len - 1].duration1 == 0) ? 1 : 0;
-    mp_obj_t list = mp_obj_new_list(len * 2 - odd, NULL);
+    mp_obj_t list = mp_obj_new_list(self->recv_count, NULL);
     mp_obj_list_t *list_in = MP_OBJ_TO_PTR(list);
 
-    for (uint8_t i = 0; i < len; i++) {
-        int n0 = (uint16_t) data[i].duration0;
-        int n1 = (uint16_t) data[i].duration1;
-        if (!data[i].level0) {
-            n0 = -n0;
-        }
-        if (!data[i].level1) {
-            n1 = -n1;
-        }
-        list_in->items[i * 2 + 0] = mp_obj_new_int(n0);
-        if ((i < (len-1)) || (!odd)) {
-            list_in->items[i * 2 + 1] = mp_obj_new_int(n1);
-        }
+    for (uint8_t i = 0; i < self->recv_count; i++) {
+        list_in->items[i] = mp_obj_new_int(self->recv_data[i]);
     }
 
     self->recv_locked = false;
@@ -92,17 +76,45 @@ static mp_obj_t rmt_recv_done_upperhalf(mp_obj_t self_in) {
 
 static MP_DEFINE_CONST_FUN_OBJ_1(rmt_recv_done_upperhalf_obj, rmt_recv_done_upperhalf);
 
-// Interrupt handler
+// Interrupt handler, possibly running in a different core
 static bool IRAM_ATTR rmt_recv_done(rmt_channel_handle_t channel, const rmt_rx_done_event_data_t *edata, void *udata){
     esp32_rmt2_obj_t *self = udata;
 
-    if (!self->recv_locked) {
-            self->recv_num_symbols = edata->num_symbols;
-            memcpy(self->recv_symbols, edata->received_symbols, edata->num_symbols * sizeof(rmt_symbol_word_t));
-            self->recv_locked = true;
-    }
+    const rmt_symbol_word_t *data = edata->received_symbols;
+    size_t len = edata->num_symbols;
+    int odd = (data[len - 1].duration1 == 0) ? 1 : 0;
+    int list_len = len * 2 - odd;
 
-    mp_sched_schedule(MP_OBJ_FROM_PTR(&rmt_recv_done_upperhalf_obj), MP_OBJ_FROM_PTR(self));
+    if (!self->recv_locked) {
+        if (list_len == 57 || list_len == 49) { // FIXME configurable
+
+            for (uint8_t i = 0; i < len; i++) {
+                int n0 = (uint16_t) data[i].duration0;
+                if (n0 < 150 || n0 > 1500) { // FIXME configurable
+                    list_len = 0;
+                    break;
+                }
+                self->recv_data[i * 2 + 0] = n0 * (data[i].level0 ? +1 : -1);
+
+                if (odd && i == (len - 1)) {
+                    continue;
+                }
+
+                int n1 = (uint16_t) data[i].duration1;
+                if (n1 < 150 || n1 > 1500) { // FIXME configurable
+                    list_len = 0;
+                    break;
+                }
+                self->recv_data[i * 2 + 1] = n1 * (data[i].level1 ? +1 : -1);
+            }
+            
+            if (list_len > 0) {
+                self->recv_count = list_len;
+                self->recv_locked = true;
+                mp_sched_schedule(MP_OBJ_FROM_PTR(&rmt_recv_done_upperhalf_obj), MP_OBJ_FROM_PTR(self));
+            }
+        }
+    }
 
     if (self->continue_rx) {
         rmt_receive(self->rx_channel, self->symbols, self->symbols_size, &self->rx_config);
@@ -110,6 +122,45 @@ static bool IRAM_ATTR rmt_recv_done(rmt_channel_handle_t channel, const rmt_rx_d
 
     return false;
 }
+
+#if MP_TASK_COREID == 0
+
+typedef struct _rmt_install_state_t {
+    SemaphoreHandle_t handle;
+    esp32_rmt2_obj_t* self;
+    esp_err_t ret;
+} rmt_install_state_t;
+
+static void start_rmt_rx_task(void *pvParameter) {
+    rmt_install_state_t *state = pvParameter;
+    esp32_rmt2_obj_t* self = state->self;
+    state->ret = rmt_receive(self->rx_channel, self->symbols, self->symbols_size, &self->rx_config);
+    xSemaphoreGive(state->handle);
+    vTaskDelete(NULL);
+}
+
+// Call rmt_driver_install on core 1.  This ensures that the RMT interrupt handler is
+// serviced on core 1, so that WiFi (if active) does not interrupt it and cause glitches.
+esp_err_t start_rmt_rx_core1(esp32_rmt2_obj_t* self) {
+    TaskHandle_t th;
+    rmt_install_state_t state;
+    state.handle = xSemaphoreCreateBinary();
+    state.self = self;
+    xTaskCreatePinnedToCore(start_rmt_rx_task, "start_rmt_rx_task", 2048 / sizeof(StackType_t), &state, ESP_TASK_PRIO_MIN + 1, &th, 1);
+    xSemaphoreTake(state.handle, portMAX_DELAY);
+    vSemaphoreDelete(state.handle);
+    return state.ret;
+}
+
+#else
+
+// MicroPython runs on core 1, so we can call the RMT installer directly and its
+// interrupt handler will also run on core 1.
+esp_err_t start_rmt_rx_core1(esp32_rmt2_obj_t* self) {
+    return rmt_receive(self->rx_channel, self->symbols, self->symbols_size, &self->rx_config);
+}
+
+#endif
 
 static mp_obj_t esp32_rmt2_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *all_args) {
     static const mp_arg_t allowed_args[] = {
@@ -159,7 +210,7 @@ static mp_obj_t esp32_rmt2_make_new(const mp_obj_type_t *type, size_t n_args, si
     self->num_symbols = num_symbols;
     self->symbols_size = num_symbols * sizeof(rmt_symbol_word_t);
     self->symbols = m_realloc(NULL, self->symbols_size);
-    self->recv_symbols = m_realloc(NULL, self->symbols_size);
+    self->recv_data = m_realloc(NULL, self->symbols_size * 2 * sizeof(int));
 
     self->rx_config.signal_range_min_ns = min_ns;
     self->rx_config.signal_range_max_ns = max_ns;
@@ -176,7 +227,8 @@ static mp_obj_t esp32_rmt2_make_new(const mp_obj_type_t *type, size_t n_args, si
     check_esp_err(rmt_rx_register_event_callbacks(self->rx_channel, &cbs, self));
     check_esp_err(rmt_enable(self->rx_channel));
 
-    self->recv_num_symbols = 0;
+    self->recv_count = 0;
+    self->continue_rx = false;
 
     return MP_OBJ_FROM_PTR(self);
 }
@@ -201,8 +253,10 @@ static mp_obj_t esp32_rmt2_deinit(mp_obj_t self_in) {
     self->cb = mp_const_none;
     m_free(self->symbols);
     self->symbols = 0;
-    m_free(self->recv_symbols);
-    self->recv_symbols = 0;
+    m_free(self->recv_data);
+    self->recv_count = 0;
+    self->recv_locked = false;
+    self->continue_rx = false;
 
     return mp_const_none;
 }
@@ -222,10 +276,12 @@ static MP_DEFINE_CONST_FUN_OBJ_1(esp32_rmt2_stop_read_pulses_obj, esp32_rmt2_sto
 static mp_obj_t esp32_rmt2_read_pulses(mp_obj_t self_in) {
     esp32_rmt2_obj_t *self = MP_OBJ_TO_PTR(self_in);
 
+    if (self->continue_rx) {
+        return mp_const_none;
+    }
+
     self->continue_rx = true;
-    self->recv_locked = false;
-    self->recv_num_symbols = 0;
-    check_esp_err(rmt_receive(self->rx_channel, self->symbols, self->symbols_size, &self->rx_config));
+    check_esp_err(start_rmt_rx_core1(self));
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(esp32_rmt2_read_pulses_obj, esp32_rmt2_read_pulses);

@@ -19,7 +19,7 @@ def cb(l):
     totalb += len(l)
     print(len(l), l)
 
-r = esp32.RMT2(pin=p, cb=cb, buf=128)
+r = esp32.RMT2(pin=p, cb=cb, buf=64, min_ns=3100, max_ns=5000000, resolution_hz=1000000)
 r.read_pulses()
 */
 
@@ -113,9 +113,12 @@ static bool IRAM_ATTR rmt_recv_done(rmt_channel_handle_t channel, const rmt_rx_d
 
 static mp_obj_t esp32_rmt2_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *all_args) {
     static const mp_arg_t allowed_args[] = {
-        { MP_QSTR_pin,       MP_ARG_REQUIRED | MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_obj = mp_const_none} },
-        { MP_QSTR_cb,        MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_obj = mp_const_none} },
-        { MP_QSTR_buf,       MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 64} },
+        { MP_QSTR_pin,           MP_ARG_REQUIRED | MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_obj = mp_const_none} },
+        { MP_QSTR_cb,                              MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_obj = mp_const_none} },
+        { MP_QSTR_buf,                             MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 64} },
+        { MP_QSTR_min_ns,        MP_ARG_REQUIRED | MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 0} },
+        { MP_QSTR_max_ns,        MP_ARG_REQUIRED | MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 0} },
+        { MP_QSTR_resolution_hz, MP_ARG_REQUIRED | MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 0} },
     };
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
     mp_arg_parse_all_kw_array(n_args, n_kw, all_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
@@ -130,6 +133,25 @@ static mp_obj_t esp32_rmt2_make_new(const mp_obj_type_t *type, size_t n_args, si
         mp_raise_ValueError(MP_ERROR_TEXT("buf must be at least 64 and even"));
     }
 
+    // RMT new driver does not have a way to specify a group clock divisor, see
+    // https://github.com/espressif/esp-idf/issues/14760#issuecomment-2430770601 and
+    // https://github.com/espressif/esp-idf/issues/11262
+    // since signal_range_min_ns must fit in an 8-bit register, the value is limited
+    // to 3190ns (80MHz clock * 3190 / 1000000000 [conversion to ns] == 255).
+
+    int min_ns = args[3].u_int;
+    if (min_ns <= 0) {
+        mp_raise_ValueError(MP_ERROR_TEXT("min_ns must be positive"));
+    }
+    int max_ns = args[4].u_int;
+    if (max_ns <= min_ns) {
+        mp_raise_ValueError(MP_ERROR_TEXT("max_ns must be bigger than min_ns"));
+    }
+    int resolution_hz = args[5].u_int;
+    if (resolution_hz < 0) {
+        mp_raise_ValueError(MP_ERROR_TEXT("resolution_hz must be positive"));
+    }
+
     esp32_rmt2_obj_t *self = mp_obj_malloc_with_finaliser(esp32_rmt2_obj_t, &esp32_rmt2_type);
 
     self->cb = cb;
@@ -139,21 +161,11 @@ static mp_obj_t esp32_rmt2_make_new(const mp_obj_type_t *type, size_t n_args, si
     self->symbols = m_realloc(NULL, self->symbols_size);
     self->recv_symbols = m_realloc(NULL, self->symbols_size);
 
-    // RMT new driver does not have a way to specify a group clock divisor, see
-    // https://github.com/espressif/esp-idf/issues/14760#issuecomment-2430770601 and
-    // https://github.com/espressif/esp-idf/issues/11262
-    // since signal_range_min_ns must fit in an 8-bit register, the value is limited
-    // to 3190ns (80MHz clock * 3190 / 1000000000 [conversion to ns] == 255).
-
-    // FIXME configurable
-    self->rx_config.signal_range_min_ns = 3100;
-    // FIXME configurable
-    self->rx_config.signal_range_max_ns = 5 * 1000 * 1000;
-
+    self->rx_config.signal_range_min_ns = min_ns;
+    self->rx_config.signal_range_max_ns = max_ns;
     self->rx_ch_conf.gpio_num = self->pin = pin_id;
     self->rx_ch_conf.clk_src = RMT_CLK_SRC_DEFAULT;
-    // FIXME configurable
-    self->rx_ch_conf.resolution_hz = 1000000;
+    self->rx_ch_conf.resolution_hz = resolution_hz;
     self->rx_ch_conf.mem_block_symbols = num_symbols;
 
     check_esp_err(rmt_new_rx_channel(&self->rx_ch_conf, &self->rx_channel));
@@ -171,9 +183,10 @@ static mp_obj_t esp32_rmt2_make_new(const mp_obj_type_t *type, size_t n_args, si
 
 static void esp32_rmt2_print(const mp_print_t *print, mp_obj_t self_in, mp_print_kind_t kind) {
     esp32_rmt2_obj_t *self = MP_OBJ_TO_PTR(self_in);
-    mp_printf(print, "RMT2 pin=%u buf=%u(x2) %u %s",
+    mp_printf(print, "RMT2 pin=%u buf=%u(x2) min_ns=%u max_ns=%u,resolution_hz=%u, last_recv=%u",
                     self->pin, self->num_symbols,
-                    self->recv_num_symbols, self->recv_locked ? "locked" : "unlocked");
+                    self->rx_config.signal_range_min_ns, self->rx_config.signal_range_max_ns,
+                    self->rx_ch_conf.resolution_hz);
 }
 
 

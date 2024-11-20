@@ -103,6 +103,7 @@ static bool IRAM_ATTR rmt_recv_done(rmt_channel_handle_t channel, const rmt_rx_d
     }
 
     mp_sched_schedule(MP_OBJ_FROM_PTR(&rmt_recv_done_upperhalf_obj), MP_OBJ_FROM_PTR(self));
+    mp_hal_wake_main_task_from_isr();
 
     if (self->continue_rx) {
         rmt_receive(self->rx_channel, self->symbols, self->symbols_size, &self->rx_config);

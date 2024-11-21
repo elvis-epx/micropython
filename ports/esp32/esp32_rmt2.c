@@ -42,8 +42,8 @@ typedef struct _esp32_rmt2_obj_t {
 
     // double buffering of received data
     bool recv_available;
-    size_t recv_num_symbols;
-    rmt_symbol_word_t *recv_symbols;
+    size_t recv_count;
+    int *recv_data;
 } esp32_rmt2_obj_t;
 
 // Interrupt handler
@@ -51,12 +51,39 @@ static bool IRAM_ATTR rmt_recv_done(rmt_channel_handle_t channel, const rmt_rx_d
     esp32_rmt2_obj_t *self = udata;
 
     if (!self->recv_available) {
-        self->recv_num_symbols = edata->num_symbols;
-        memcpy(self->recv_symbols, edata->received_symbols, edata->num_symbols * sizeof(rmt_symbol_word_t));
-        self->recv_available = true;
-    }
+        const rmt_symbol_word_t *data = edata->received_symbols;
+        size_t len = edata->num_symbols;
+        int odd = (data[len - 1].duration1 == 0) ? 1 : 0;
+        int list_len = len * 2 - odd;
 
-    // mp_hal_wake_main_task_from_isr();
+        if (list_len == 57 || list_len == 49) { // FIXME configurable
+
+            for (uint8_t i = 0; i < len; i++) {
+                int n0 = (uint16_t) data[i].duration0;
+                if (n0 < 150 || n0 > 1500) { // FIXME configurable
+                    list_len = 0;
+                    break;
+                }
+                self->recv_data[i * 2 + 0] = n0 * (data[i].level0 ? +1 : -1);
+
+                if (odd && i == (len - 1)) {
+                    continue;
+                }
+
+                int n1 = (uint16_t) data[i].duration1;
+                if (n1 < 150 || n1 > 1500) { // FIXME configurable
+                    list_len = 0;
+                    break;
+                }
+                self->recv_data[i * 2 + 1] = n1 * (data[i].level1 ? +1 : -1);
+            }
+            
+            self->recv_count = list_len;
+            if (list_len > 0) {
+                self->recv_available = true;
+            }
+        }
+    }
 
     if (self->continue_rx) {
         rmt_receive(self->rx_channel, self->symbols, self->symbols_size, &self->rx_config);
@@ -107,7 +134,8 @@ static mp_obj_t esp32_rmt2_make_new(const mp_obj_type_t *type, size_t n_args, si
     self->num_symbols = num_symbols;
     self->symbols_size = num_symbols * sizeof(rmt_symbol_word_t);
     self->symbols = m_realloc(NULL, self->symbols_size);
-    self->recv_symbols = m_realloc(NULL, self->symbols_size);
+    self->recv_data = m_realloc(NULL, self->symbols_size * 2 * sizeof(int));
+    self->recv_count = 0;
     self->recv_available = false;
 
     self->rx_config.signal_range_min_ns = min_ns;
@@ -124,8 +152,6 @@ static mp_obj_t esp32_rmt2_make_new(const mp_obj_type_t *type, size_t n_args, si
     // TODO call from task to move to different core?
     check_esp_err(rmt_rx_register_event_callbacks(self->rx_channel, &cbs, self));
     check_esp_err(rmt_enable(self->rx_channel));
-
-    self->recv_num_symbols = 0;
 
     return MP_OBJ_FROM_PTR(self);
 }
@@ -149,9 +175,11 @@ static mp_obj_t esp32_rmt2_deinit(mp_obj_t self_in) {
     }
     m_free(self->symbols);
     self->symbols = 0;
-    m_free(self->recv_symbols);
-    self->recv_symbols = 0;
+    m_free(self->recv_data);
+    self->recv_data = 0;
+    self->recv_count = 0;
     self->recv_available = false;
+    self->continue_rx = false;
 
     return mp_const_none;
 }
@@ -164,6 +192,7 @@ static mp_obj_t esp32_rmt2_stop_read_pulses(mp_obj_t self_in) {
     bool ret = self->continue_rx;
     self->continue_rx = false;
     self->recv_available = false;
+    self->recv_count = 0;
     return ret ? mp_const_true : mp_const_false;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(esp32_rmt2_stop_read_pulses_obj, esp32_rmt2_stop_read_pulses);
@@ -174,7 +203,7 @@ static mp_obj_t esp32_rmt2_read_pulses(mp_obj_t self_in) {
 
     self->continue_rx = true;
     self->recv_available = false;
-    self->recv_num_symbols = 0;
+    self->recv_count = 0;
     check_esp_err(rmt_receive(self->rx_channel, self->symbols, self->symbols_size, &self->rx_config));
     return mp_const_none;
 }
@@ -188,27 +217,11 @@ static mp_obj_t esp32_rmt2_get_data(mp_obj_t self_in) {
         return mp_const_none;
     }
 
-    // convert RMT samples to list
-    size_t len = self->recv_num_symbols;
-    const rmt_symbol_word_t *data = self->recv_symbols;
-
-    int odd = (data[len - 1].duration1 == 0) ? 1 : 0;
-    mp_obj_t list = mp_obj_new_list(len * 2 - odd, NULL);
+    mp_obj_t list = mp_obj_new_list(self->recv_count, NULL);
     mp_obj_list_t *list_in = MP_OBJ_TO_PTR(list);
 
-    for (uint8_t i = 0; i < len; i++) {
-        int n0 = (uint16_t) data[i].duration0;
-        int n1 = (uint16_t) data[i].duration1;
-        if (!data[i].level0) {
-            n0 = -n0;
-        }
-        if (!data[i].level1) {
-            n1 = -n1;
-        }
-        list_in->items[i * 2 + 0] = mp_obj_new_int(n0);
-        if ((i < (len-1)) || (!odd)) {
-            list_in->items[i * 2 + 1] = mp_obj_new_int(n1);
-        }
+    for (uint8_t i = 0; i < self->recv_count; i++) {
+        list_in->items[i] = mp_obj_new_int(self->recv_data[i]);
     }
 
     self->recv_available = false;

@@ -14,6 +14,7 @@ import machine, esp32
 p = machine.Pin(14)
 
 r = esp32.RMT2(pin=p, buf=64, min_ns=3100, max_ns=5000000, resolution_hz=1000000)
+# optional params: soft_{min,max}_{len,value}
 r.read_pulses()
 r.get_data() # returns None if no data
 
@@ -44,6 +45,12 @@ typedef struct _esp32_rmt2_obj_t {
     bool recv_available;
     size_t recv_count;
     int *recv_data;
+
+    // soft filtering values
+    int soft_min_len;
+    int soft_max_len;
+    int soft_min_value;
+    int soft_max_value;
 } esp32_rmt2_obj_t;
 
 // Interrupt handler
@@ -56,11 +63,10 @@ static bool IRAM_ATTR rmt_recv_done(rmt_channel_handle_t channel, const rmt_rx_d
         int odd = (data[len - 1].duration1 == 0) ? 1 : 0;
         int list_len = len * 2 - odd;
 
-        if (list_len == 57 || list_len == 49) { // FIXME configurable
-
+        if (list_len >= self->soft_min_len && list_len <= self->soft_max_len) {
             for (uint8_t i = 0; i < len; i++) {
                 int n0 = (uint16_t) data[i].duration0;
-                if (n0 < 150 || n0 > 1500) { // FIXME configurable
+                if (n0 < self->soft_min_value || n0 > self->soft_max_value) {
                     list_len = 0;
                     break;
                 }
@@ -71,7 +77,7 @@ static bool IRAM_ATTR rmt_recv_done(rmt_channel_handle_t channel, const rmt_rx_d
                 }
 
                 int n1 = (uint16_t) data[i].duration1;
-                if (n1 < 150 || n1 > 1500) { // FIXME configurable
+                if (n1 < self->soft_min_value || n1 > self->soft_max_value) {
                     list_len = 0;
                     break;
                 }
@@ -99,6 +105,10 @@ static mp_obj_t esp32_rmt2_make_new(const mp_obj_type_t *type, size_t n_args, si
         { MP_QSTR_min_ns,        MP_ARG_REQUIRED | MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 0} },
         { MP_QSTR_max_ns,        MP_ARG_REQUIRED | MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 0} },
         { MP_QSTR_resolution_hz, MP_ARG_REQUIRED | MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 0} },
+        { MP_QSTR_soft_min_len,                    MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 0} },
+        { MP_QSTR_soft_max_len,                    MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 0x7fffffff} },
+        { MP_QSTR_soft_min_value,                  MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 0} },
+        { MP_QSTR_soft_max_value,                  MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 0x7fffffff} },
     };
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
     mp_arg_parse_all_kw_array(n_args, n_kw, all_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
@@ -127,6 +137,29 @@ static mp_obj_t esp32_rmt2_make_new(const mp_obj_type_t *type, size_t n_args, si
     if (resolution_hz < 0) {
         mp_raise_ValueError(MP_ERROR_TEXT("resolution_hz must be positive"));
     }
+    int soft_min_len = args[5].u_int;
+    int soft_max_len = args[6].u_int;
+    int soft_min_value = args[7].u_int;
+    int soft_max_value = args[8].u_int;
+
+    if (soft_min_len < 0) {
+        mp_raise_ValueError(MP_ERROR_TEXT("soft_min_len must be positive"));
+    }
+    if (soft_max_len < 0) {
+        mp_raise_ValueError(MP_ERROR_TEXT("soft_max_len must be positive"));
+    }
+    if (soft_min_len > soft_max_len) {
+        mp_raise_ValueError(MP_ERROR_TEXT("soft_min_len must be less or equal than soft_max_len"));
+    }
+    if (soft_min_value < 0) {
+        mp_raise_ValueError(MP_ERROR_TEXT("soft_min_value must be positive"));
+    }
+    if (soft_max_value < 0) {
+        mp_raise_ValueError(MP_ERROR_TEXT("soft_max_value must be positive"));
+    }
+    if (soft_min_value > soft_max_value) {
+        mp_raise_ValueError(MP_ERROR_TEXT("soft_min_value must be less or equal than soft_max_value"));
+    }
 
     esp32_rmt2_obj_t *self = mp_obj_malloc_with_finaliser(esp32_rmt2_obj_t, &esp32_rmt2_type);
 
@@ -137,6 +170,10 @@ static mp_obj_t esp32_rmt2_make_new(const mp_obj_type_t *type, size_t n_args, si
     self->recv_data = m_realloc(NULL, self->symbols_size * 2 * sizeof(int));
     self->recv_count = 0;
     self->recv_available = false;
+    self->soft_min_len = soft_min_len;
+    self->soft_max_len = soft_max_len;
+    self->soft_min_value = soft_min_value;
+    self->soft_max_value = soft_max_value;
 
     self->rx_config.signal_range_min_ns = min_ns;
     self->rx_config.signal_range_max_ns = max_ns;

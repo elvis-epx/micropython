@@ -8,13 +8,16 @@
 #include "driver/rmt_rx.h"
 
 /*
+Inspired by https://github.com/junkfix/esp32-rmt-rf-rx/blob/main/esp32-rmt-rf-rx.ino
+
 import machine, esp32
 p = machine.Pin(14)
 
 r = esp32.RMT2(pin=p, buf=64, min_ns=3100, max_ns=5000000, resolution_hz=1000000)
 r.read_pulses()
 r.get_data() # returns None if no data
-# r can be poll.poll()'ed 
+
+r can be waited by poll.poll() - POLLIN
 */
 
 // dummy function to satisfy external reference (bitstream won't work)

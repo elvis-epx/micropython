@@ -4,6 +4,7 @@
  * The MIT License (MIT)
  *
  * Copyright (c) 2019 "Matt Trentini" <matt.trentini@gmail.com>
+ * Copyright (c) 2024 "Elvis Pfützenreuter" <elvis.pfutzenreuter@gmail.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -30,7 +31,8 @@
 #include "modesp32.h"
 
 #include "esp_task.h"
-#include "driver/rmt.h"
+#include "driver/rmt_tx.h"
+#include "driver/rmt_encoder.h"
 
 // This exposes the ESP32's RMT module to MicroPython. RMT is provided by the Espressif ESP-IDF:
 //
@@ -47,51 +49,46 @@
 // This current MicroPython implementation lacks some major features, notably receive pulses
 // and carrier output.
 
-// Last available RMT channel that can transmit.
-#define RMT_LAST_TX_CHANNEL (SOC_RMT_TX_CANDIDATES_PER_GROUP - 1)
-
 // Forward declaration
 extern const mp_obj_type_t esp32_rmt_type;
 
 typedef struct _esp32_rmt_obj_t {
     mp_obj_base_t base;
-    uint8_t channel_id;
+    rmt_channel_handle_t channel;
     gpio_num_t pin;
     uint8_t clock_div;
-    mp_uint_t num_items;
-    rmt_item32_t *items;
+    mp_uint_t cap_items;
+    rmt_symbol_word_t *items;
     bool loop_en;
-} esp32_rmt_obj_t;
 
-// Current channel used for machine.bitstream, in the machine_bitstream_high_low_rmt
-// implementation.  A value of -1 means do not use RMT.
-int8_t esp32_rmt_bitstream_channel_id = RMT_LAST_TX_CHANNEL;
+    rmt_encoder_handle_t encoder;
+    mp_uint_t num_symbols;
+    mp_uint_t idle_level;
+} esp32_rmt_obj_t;
 
 #if MP_TASK_COREID == 0
 
-typedef struct _rmt_install_state_t {
+typedef struct _rmt_enable_state_t {
     SemaphoreHandle_t handle;
-    uint8_t channel_id;
+    rmt_channel_handle_t channel;
     esp_err_t ret;
-} rmt_install_state_t;
+} rmt_enable_state_t;
 
-static void rmt_install_task(void *pvParameter) {
-    rmt_install_state_t *state = pvParameter;
-    state->ret = rmt_driver_install(state->channel_id, 0, 0);
+static void rmt_enable_task(void *pvParameter) {
+    rmt_enable_state_t *state = pvParameter;
+    state->ret = rmt_enable(state->channel);
     xSemaphoreGive(state->handle);
     vTaskDelete(NULL);
-    for (;;) {
-    }
 }
 
-// Call rmt_driver_install on core 1.  This ensures that the RMT interrupt handler is
+// Call rmt_enable on core 1.  This ensures that the RMT interrupt handler is
 // serviced on core 1, so that WiFi (if active) does not interrupt it and cause glitches.
-esp_err_t rmt_driver_install_core1(uint8_t channel_id) {
+esp_err_t rmt_enable_core1(rmt_channel_handle_t channel) {
     TaskHandle_t th;
-    rmt_install_state_t state;
+    rmt_enable_state_t state;
     state.handle = xSemaphoreCreateBinary();
-    state.channel_id = channel_id;
-    xTaskCreatePinnedToCore(rmt_install_task, "rmt_install_task", 2048 / sizeof(StackType_t), &state, ESP_TASK_PRIO_MIN + 1, &th, 1);
+    state.channel = channel;
+    xTaskCreatePinnedToCore(rmt_enable_task, "rmt_enable_task", 2048 / sizeof(StackType_t), &state, ESP_TASK_PRIO_MIN + 1, &th, 1);
     xSemaphoreTake(state.handle, portMAX_DELAY);
     vSemaphoreDelete(state.handle);
     return state.ret;
@@ -101,48 +98,56 @@ esp_err_t rmt_driver_install_core1(uint8_t channel_id) {
 
 // MicroPython runs on core 1, so we can call the RMT installer directly and its
 // interrupt handler will also run on core 1.
-esp_err_t rmt_driver_install_core1(uint8_t channel_id) {
-    return rmt_driver_install(channel_id, 0, 0);
+esp_err_t rmt_enable_core1(rmt_channel_handle_t channel) {
+    return rmt_enable(channel);
 }
 
 #endif
 
 static mp_obj_t esp32_rmt_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *all_args) {
     static const mp_arg_t allowed_args[] = {
-        { MP_QSTR_id,        MP_ARG_REQUIRED | MP_ARG_INT, {.u_int = -1} },
+        { MP_QSTR_id,                          MP_ARG_INT, {.u_int = -1} },
         { MP_QSTR_pin,       MP_ARG_REQUIRED | MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_obj = mp_const_none} },
         { MP_QSTR_clock_div,                   MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 8} }, // 100ns resolution
         { MP_QSTR_idle_level,                  MP_ARG_KW_ONLY | MP_ARG_BOOL, {.u_bool = false} }, // low voltage
         { MP_QSTR_tx_carrier,                  MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_obj = mp_const_none} }, // no carrier
+        { MP_QSTR_num_symbols,                 MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 64} },
     };
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
     mp_arg_parse_all_kw_array(n_args, n_kw, all_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
-    mp_uint_t channel_id = args[0].u_int;
+    // RMT channel is an opaque struct in current RMT API and channel_id is a dummy parameter
+    // mp_uint_t channel_id = args[0].u_int;
     gpio_num_t pin_id = machine_pin_get_id(args[1].u_obj);
     mp_uint_t clock_div = args[2].u_int;
     mp_uint_t idle_level = args[3].u_bool;
     mp_obj_t tx_carrier_obj = args[4].u_obj;
-
-    if (esp32_rmt_bitstream_channel_id >= 0 && channel_id == esp32_rmt_bitstream_channel_id) {
-        mp_raise_ValueError(MP_ERROR_TEXT("channel used by bitstream"));
-    }
+    mp_uint_t num_symbols = args[5].u_int;
 
     if (clock_div < 1 || clock_div > 255) {
         mp_raise_ValueError(MP_ERROR_TEXT("clock_div must be between 1 and 255"));
     }
 
+    if (num_symbols < 64 || ((num_symbols % 2) == 1)) {
+        mp_raise_ValueError(MP_ERROR_TEXT("num_symbols must be even and at least 64"));
+    }
+
     esp32_rmt_obj_t *self = mp_obj_malloc_with_finaliser(esp32_rmt_obj_t, &esp32_rmt_type);
-    self->channel_id = channel_id;
+    self->channel = NULL;
     self->pin = pin_id;
     self->clock_div = clock_div;
     self->loop_en = false;
+    self->idle_level = idle_level;
+    self->num_symbols = num_symbols;
 
-    rmt_config_t config = {0};
-    config.rmt_mode = RMT_MODE_TX;
-    config.channel = (rmt_channel_t)self->channel_id;
-    config.gpio_num = self->pin;
-    config.mem_block_num = 1;
-    config.tx_config.loop_en = 0;
+    rmt_tx_channel_config_t tx_chan_config = {
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .gpio_num = self->pin,
+        .mem_block_symbols = num_symbols,
+        .resolution_hz = APB_CLK_FREQ / clock_div,
+        .trans_queue_depth = 4,
+    };
+
+    check_esp_err(rmt_new_tx_channel(&tx_chan_config, &self->channel));
 
     if (tx_carrier_obj != mp_const_none) {
         mp_obj_t *tx_carrier_details = NULL;
@@ -158,21 +163,17 @@ static mp_obj_t esp32_rmt_make_new(const mp_obj_type_t *type, size_t n_args, siz
             mp_raise_ValueError(MP_ERROR_TEXT("tx_carrier duty must be 0..100"));
         }
 
-        config.tx_config.carrier_en = 1;
-        config.tx_config.carrier_freq_hz = frequency;
-        config.tx_config.carrier_duty_percent = duty;
-        config.tx_config.carrier_level = level;
-    } else {
-        config.tx_config.carrier_en = 0;
+        rmt_carrier_config_t tx_carrier_cfg = {
+            .duty_cycle = ((float)duty) / 100.0,
+            .frequency_hz = frequency,
+            .flags.polarity_active_low = !level,
+        };
+        check_esp_err(rmt_apply_carrier(self->channel, &tx_carrier_cfg));
     }
 
-    config.tx_config.idle_output_en = 1;
-    config.tx_config.idle_level = idle_level;
-
-    config.clk_div = self->clock_div;
-
-    check_esp_err(rmt_config(&config));
-    check_esp_err(rmt_driver_install_core1(config.channel));
+    rmt_copy_encoder_config_t copy_encoder_config = {};
+    check_esp_err(rmt_new_copy_encoder(&copy_encoder_config, &self->encoder));
+    check_esp_err(rmt_enable_core1(self->channel));
 
     return MP_OBJ_FROM_PTR(self);
 }
@@ -180,11 +181,8 @@ static mp_obj_t esp32_rmt_make_new(const mp_obj_type_t *type, size_t n_args, siz
 static void esp32_rmt_print(const mp_print_t *print, mp_obj_t self_in, mp_print_kind_t kind) {
     esp32_rmt_obj_t *self = MP_OBJ_TO_PTR(self_in);
     if (self->pin != -1) {
-        bool idle_output_en;
-        rmt_idle_level_t idle_level;
-        check_esp_err(rmt_get_idle_level(self->channel_id, &idle_output_en, &idle_level));
-        mp_printf(print, "RMT(channel=%u, pin=%u, source_freq=%u, clock_div=%u, idle_level=%u)",
-            self->channel_id, self->pin, APB_CLK_FREQ, self->clock_div, idle_level);
+        mp_printf(print, "RMT(pin=%u, source_freq=%u, clock_div=%u, idle_level=%u)",
+            self->pin, APB_CLK_FREQ, self->clock_div, self->idle_level);
     } else {
         mp_printf(print, "RMT()");
     }
@@ -194,7 +192,9 @@ static mp_obj_t esp32_rmt_deinit(mp_obj_t self_in) {
     // fixme: check for valid channel. Return exception if error occurs.
     esp32_rmt_obj_t *self = MP_OBJ_TO_PTR(self_in);
     if (self->pin != -1) { // Check if channel has already been deinitialised.
-        rmt_driver_uninstall(self->channel_id);
+        rmt_del_encoder(self->encoder);
+        rmt_disable(self->channel);
+        rmt_del_channel(self->channel);
         self->pin = -1; // -1 to indicate RMT is unused
         m_free(self->items);
     }
@@ -232,28 +232,26 @@ static mp_obj_t esp32_rmt_wait_done(size_t n_args, const mp_obj_t *pos_args, mp_
 
     esp32_rmt_obj_t *self = MP_OBJ_TO_PTR(args[0].u_obj);
 
-    esp_err_t err = rmt_wait_tx_done(self->channel_id, args[1].u_int / portTICK_PERIOD_MS);
+    esp_err_t err = rmt_tx_wait_all_done(self->channel, args[1].u_int);
     return err == ESP_OK ? mp_const_true : mp_const_false;
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(esp32_rmt_wait_done_obj, 1, esp32_rmt_wait_done);
 
+// TODO allow tx to be poll()'ed and/or provide a callback using the
+// API rmt_tx_register_event_callback()
+
 static mp_obj_t esp32_rmt_loop(mp_obj_t self_in, mp_obj_t loop) {
     esp32_rmt_obj_t *self = MP_OBJ_TO_PTR(self_in);
     self->loop_en = mp_obj_get_int(loop);
-    if (!self->loop_en) {
-        bool loop_en;
-        check_esp_err(rmt_get_tx_loop_mode(self->channel_id, &loop_en));
-        if (loop_en) {
-            check_esp_err(rmt_set_tx_loop_mode(self->channel_id, false));
-            check_esp_err(rmt_set_tx_intr_en(self->channel_id, true));
-        }
-    }
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_2(esp32_rmt_loop_obj, esp32_rmt_loop);
 
 static mp_obj_t esp32_rmt_write_pulses(size_t n_args, const mp_obj_t *args) {
     esp32_rmt_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+
+    rmt_tx_wait_all_done(self->channel, -1);
+
     mp_obj_t duration_obj = args[1];
     mp_obj_t data_obj = n_args > 2 ? args[2] : mp_const_true;
 
@@ -288,14 +286,17 @@ static mp_obj_t esp32_rmt_write_pulses(size_t n_args, const mp_obj_t *args) {
     if (num_pulses == 0) {
         mp_raise_ValueError(MP_ERROR_TEXT("No pulses"));
     }
-    if (self->loop_en && num_pulses > 126) {
-        mp_raise_ValueError(MP_ERROR_TEXT("Too many pulses for loop"));
-    }
 
     mp_uint_t num_items = (num_pulses / 2) + (num_pulses % 2);
-    if (num_items > self->num_items) {
-        self->items = (rmt_item32_t *)m_realloc(self->items, num_items * sizeof(rmt_item32_t *));
-        self->num_items = num_items;
+    /*
+    if (num_items > self->num_symbols) {
+        mp_raise_ValueError(MP_ERROR_TEXT("Too many pulses for allocated num_symbols"));
+    }
+    */
+
+    if (num_items > self->cap_items) {
+        self->items = (rmt_symbol_word_t *)m_realloc(self->items, num_items * sizeof(rmt_symbol_word_t *));
+        self->cap_items = num_items;
     }
 
     for (mp_uint_t item_index = 0, pulse_index = 0; item_index < num_items; item_index++) {
@@ -312,53 +313,21 @@ static mp_obj_t esp32_rmt_write_pulses(size_t n_args, const mp_obj_t *args) {
         }
     }
 
-    if (self->loop_en) {
-        bool loop_en;
-        check_esp_err(rmt_get_tx_loop_mode(self->channel_id, &loop_en));
-        if (loop_en) {
-            check_esp_err(rmt_set_tx_intr_en(self->channel_id, true));
-            check_esp_err(rmt_set_tx_loop_mode(self->channel_id, false));
-        }
-        check_esp_err(rmt_wait_tx_done(self->channel_id, portMAX_DELAY));
-    }
+    /* TODO change loop_en to int, or create another property, to support a finite loop count */
+    /* TODO clarify if eot_level means the same as idle_level */
+    /* TODO add disable() or stop() method to call rmt_disable() to break an infinite loop w/o resorting to gc.collect() */
 
-    #if !CONFIG_IDF_TARGET_ESP32S3
-    check_esp_err(rmt_write_items(self->channel_id, self->items, num_items, false));
-    #endif
+    rmt_transmit_config_t tx_config = {
+        .loop_count = self->loop_en ? -1 : 0,
+        .flags.eot_level = self->idle_level ? 1 : 0,
+    };
 
-    if (self->loop_en) {
-        check_esp_err(rmt_set_tx_intr_en(self->channel_id, false));
-        check_esp_err(rmt_set_tx_loop_mode(self->channel_id, true));
-    }
-
-    #if CONFIG_IDF_TARGET_ESP32S3
-    check_esp_err(rmt_write_items(self->channel_id, self->items, num_items, false));
-    #endif
+    rmt_encoder_reset(self->encoder);
+    check_esp_err(rmt_transmit(self->channel, self->encoder, self->items, num_items * sizeof(rmt_symbol_word_t), &tx_config));
 
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(esp32_rmt_write_pulses_obj, 2, 3, esp32_rmt_write_pulses);
-
-static mp_obj_t esp32_rmt_bitstream_channel(size_t n_args, const mp_obj_t *args) {
-    if (n_args > 0) {
-        if (args[0] == mp_const_none) {
-            esp32_rmt_bitstream_channel_id = -1;
-        } else {
-            mp_int_t channel_id = mp_obj_get_int(args[0]);
-            if (channel_id < 0 || channel_id > RMT_LAST_TX_CHANNEL) {
-                mp_raise_ValueError(MP_ERROR_TEXT("invalid channel"));
-            }
-            esp32_rmt_bitstream_channel_id = channel_id;
-        }
-    }
-    if (esp32_rmt_bitstream_channel_id < 0) {
-        return mp_const_none;
-    } else {
-        return MP_OBJ_NEW_SMALL_INT(esp32_rmt_bitstream_channel_id);
-    }
-}
-static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(esp32_rmt_bitstream_channel_fun_obj, 0, 1, esp32_rmt_bitstream_channel);
-static MP_DEFINE_CONST_STATICMETHOD_OBJ(esp32_rmt_bitstream_channel_obj, MP_ROM_PTR(&esp32_rmt_bitstream_channel_fun_obj));
 
 static const mp_rom_map_elem_t esp32_rmt_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR___del__), MP_ROM_PTR(&esp32_rmt_deinit_obj) },
@@ -367,9 +336,6 @@ static const mp_rom_map_elem_t esp32_rmt_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_wait_done), MP_ROM_PTR(&esp32_rmt_wait_done_obj) },
     { MP_ROM_QSTR(MP_QSTR_loop), MP_ROM_PTR(&esp32_rmt_loop_obj) },
     { MP_ROM_QSTR(MP_QSTR_write_pulses), MP_ROM_PTR(&esp32_rmt_write_pulses_obj) },
-
-    // Static methods
-    { MP_ROM_QSTR(MP_QSTR_bitstream_channel), MP_ROM_PTR(&esp32_rmt_bitstream_channel_obj) },
 
     // Class methods
     { MP_ROM_QSTR(MP_QSTR_source_freq), MP_ROM_PTR(&esp32_rmt_source_obj) },

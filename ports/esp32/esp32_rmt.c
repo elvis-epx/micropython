@@ -62,6 +62,7 @@ typedef struct _esp32_rmt_obj_t {
     mp_uint_t cap_items;
     rmt_symbol_word_t *items;
     int loop_count;
+    int tx_ongoing;
 
     rmt_encoder_handle_t encoder;
     mp_uint_t num_symbols;
@@ -106,6 +107,12 @@ esp_err_t rmt_enable_core1(rmt_channel_handle_t channel) {
 
 #endif
 
+static bool IRAM_ATTR esp32_rmt_tx_trans_done(rmt_channel_handle_t channel, const rmt_tx_done_event_data_t *edata, void  *user_ctx) {
+    esp32_rmt_obj_t *self = user_ctx;
+    self->tx_ongoing -= 1;
+    return false;
+}
+
 static mp_obj_t esp32_rmt_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *all_args) {
     static const mp_arg_t allowed_args[] = {
         { MP_QSTR_id,                          MP_ARG_INT, {.u_int = -1} },
@@ -138,6 +145,7 @@ static mp_obj_t esp32_rmt_make_new(const mp_obj_type_t *type, size_t n_args, siz
     self->pin = pin_id;
     self->clock_div = clock_div;
     self->loop_count = 0;
+    self->tx_ongoing = 0;
     self->idle_level = idle_level;
     self->num_symbols = num_symbols;
     self->enabled = false;
@@ -177,6 +185,11 @@ static mp_obj_t esp32_rmt_make_new(const mp_obj_type_t *type, size_t n_args, siz
     rmt_copy_encoder_config_t copy_encoder_config = {};
     check_esp_err(rmt_new_copy_encoder(&copy_encoder_config, &self->encoder));
 
+    rmt_tx_event_callbacks_t callbacks = {
+        .on_trans_done = esp32_rmt_tx_trans_done,
+    };
+    check_esp_err(rmt_tx_register_event_callbacks(self->channel, &callbacks, self));
+
     return MP_OBJ_FROM_PTR(self);
 }
 
@@ -194,6 +207,8 @@ static mp_obj_t esp32_rmt_disable(mp_obj_t self_in) {
     esp32_rmt_obj_t *self = MP_OBJ_TO_PTR(self_in);
 
     if (self->enabled) {
+        // FIXME panics if called while tx is ongoing and not an infinite loop
+        //       (does not panic if called en passant of esp32_rmt_release()).
         rmt_disable(self->channel);
         self->enabled = false;
         return mp_const_true;
@@ -208,9 +223,14 @@ static mp_obj_t esp32_rmt_release(mp_obj_t self_in) {
 
     if (self->pin != -1) { // Check if channel has already been deinitialised.
         esp32_rmt_disable(self_in);
+        rmt_tx_event_callbacks_t callbacks = {
+            .on_trans_done = NULL,
+        };
+        rmt_tx_register_event_callbacks(self->channel, &callbacks, self);
         rmt_del_encoder(self->encoder);
         rmt_del_channel(self->channel);
         self->pin = -1; // -1 to indicate RMT is unused
+        self->tx_ongoing = 0;
         m_free(self->items);
         return mp_const_true;
     }
@@ -262,6 +282,9 @@ static mp_obj_t esp32_rmt_wait_done(size_t n_args, const mp_obj_t *pos_args, mp_
         mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("already released"));
     } else if (!self->enabled) {
         return mp_const_true;
+    } else if (args[1].u_int == 0 && self->tx_ongoing > 0) {
+        // shortcut to avoid console spamming with timeout msgs by rmt_tx_wait_all_done()
+        return mp_const_false;
     }
 
     esp_err_t err = rmt_tx_wait_all_done(self->channel, args[1].u_int);
@@ -276,10 +299,9 @@ static mp_uint_t esp32_rmt_stream_ioctl(
         return MP_STREAM_ERROR;
     }
     esp32_rmt_obj_t *self = MP_OBJ_TO_PTR(self_in);
-    esp_err_t err = (!self->enabled) ? ESP_OK : rmt_tx_wait_all_done(self->channel, 0);
     return arg ^ (
                // If tx is ongoing, unset the Read ready flag
-               (err == ESP_OK ? 0 : MP_STREAM_POLL_RD));
+               (self->tx_ongoing <= 0 ? 0 : MP_STREAM_POLL_RD));
 }
 
 static const mp_stream_p_t esp32_rmt_stream_p = {
@@ -401,6 +423,7 @@ static mp_obj_t esp32_rmt_write_pulses(size_t n_args, const mp_obj_t *args) {
 
     rmt_encoder_reset(self->encoder);
     check_esp_err(rmt_transmit(self->channel, self->encoder, self->items, num_items * sizeof(rmt_symbol_word_t), &tx_config));
+    self->tx_ongoing += 1;
 
     return mp_const_none;
 }

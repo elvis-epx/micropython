@@ -27,6 +27,7 @@
 
 #include "py/mphal.h"
 #include "py/runtime.h"
+#include "py/stream.h"
 #include "modmachine.h"
 #include "modesp32.h"
 
@@ -55,11 +56,12 @@ extern const mp_obj_type_t esp32_rmt_type;
 typedef struct _esp32_rmt_obj_t {
     mp_obj_base_t base;
     rmt_channel_handle_t channel;
+    bool enabled;
     gpio_num_t pin;
     uint8_t clock_div;
     mp_uint_t cap_items;
     rmt_symbol_word_t *items;
-    bool loop_en;
+    int loop_count;
 
     rmt_encoder_handle_t encoder;
     mp_uint_t num_symbols;
@@ -135,9 +137,10 @@ static mp_obj_t esp32_rmt_make_new(const mp_obj_type_t *type, size_t n_args, siz
     self->channel = NULL;
     self->pin = pin_id;
     self->clock_div = clock_div;
-    self->loop_en = false;
+    self->loop_count = 0;
     self->idle_level = idle_level;
     self->num_symbols = num_symbols;
+    self->enabled = false;
 
     rmt_tx_channel_config_t tx_chan_config = {
         .clk_src = RMT_CLK_SRC_DEFAULT,
@@ -173,7 +176,6 @@ static mp_obj_t esp32_rmt_make_new(const mp_obj_type_t *type, size_t n_args, siz
 
     rmt_copy_encoder_config_t copy_encoder_config = {};
     check_esp_err(rmt_new_copy_encoder(&copy_encoder_config, &self->encoder));
-    check_esp_err(rmt_enable_core1(self->channel));
 
     return MP_OBJ_FROM_PTR(self);
 }
@@ -188,16 +190,37 @@ static void esp32_rmt_print(const mp_print_t *print, mp_obj_t self_in, mp_print_
     }
 }
 
-static mp_obj_t esp32_rmt_deinit(mp_obj_t self_in) {
-    // fixme: check for valid channel. Return exception if error occurs.
+static mp_obj_t esp32_rmt_disable(mp_obj_t self_in) {
     esp32_rmt_obj_t *self = MP_OBJ_TO_PTR(self_in);
-    if (self->pin != -1) { // Check if channel has already been deinitialised.
-        rmt_del_encoder(self->encoder);
+
+    if (self->enabled) {
         rmt_disable(self->channel);
+        self->enabled = false;
+        return mp_const_true;
+    }
+
+    return mp_const_false;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(esp32_rmt_disable_obj, esp32_rmt_disable);
+
+static mp_obj_t esp32_rmt_release(mp_obj_t self_in) {
+    esp32_rmt_obj_t *self = MP_OBJ_TO_PTR(self_in);
+
+    if (self->pin != -1) { // Check if channel has already been deinitialised.
+        esp32_rmt_disable(self_in);
+        rmt_del_encoder(self->encoder);
         rmt_del_channel(self->channel);
         self->pin = -1; // -1 to indicate RMT is unused
         m_free(self->items);
+        return mp_const_true;
     }
+
+    return mp_const_false;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(esp32_rmt_release_obj, esp32_rmt_release);
+
+static mp_obj_t esp32_rmt_deinit(mp_obj_t self_in) {
+    esp32_rmt_release(self_in);
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(esp32_rmt_deinit_obj, esp32_rmt_deinit);
@@ -214,6 +237,10 @@ static MP_DEFINE_CONST_STATICMETHOD_OBJ(esp32_rmt_source_obj, MP_ROM_PTR(&esp32_
 // Return the clock divider.
 static mp_obj_t esp32_rmt_clock_div(mp_obj_t self_in) {
     esp32_rmt_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    if (self->pin == -1) {
+        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("already released"));
+    }
+
     return mp_obj_new_int(self->clock_div);
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(esp32_rmt_clock_div_obj, esp32_rmt_clock_div);
@@ -231,26 +258,85 @@ static mp_obj_t esp32_rmt_wait_done(size_t n_args, const mp_obj_t *pos_args, mp_
     mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
 
     esp32_rmt_obj_t *self = MP_OBJ_TO_PTR(args[0].u_obj);
+    if (self->pin == -1) {
+        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("already released"));
+    } else if (!self->enabled) {
+        return mp_const_true;
+    }
 
     esp_err_t err = rmt_tx_wait_all_done(self->channel, args[1].u_int);
     return err == ESP_OK ? mp_const_true : mp_const_false;
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(esp32_rmt_wait_done_obj, 1, esp32_rmt_wait_done);
 
-// TODO allow tx to be poll()'ed and/or provide a callback using the
-// API rmt_tx_register_event_callback()
+static mp_uint_t esp32_rmt_stream_ioctl(
+    mp_obj_t self_in, mp_uint_t request, uintptr_t arg, int *errcode) {
+    if (request != MP_STREAM_POLL) {
+        *errcode = MP_EINVAL;
+        return MP_STREAM_ERROR;
+    }
+    esp32_rmt_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    esp_err_t err = (!self->enabled) ? ESP_OK : rmt_tx_wait_all_done(self->channel, 0);
+    return arg ^ (
+               // If tx is ongoing, unset the Read ready flag
+               (err == ESP_OK ? 0 : MP_STREAM_POLL_RD));
+}
+
+static const mp_stream_p_t esp32_rmt_stream_p = {
+    .ioctl = esp32_rmt_stream_ioctl,
+};
 
 static mp_obj_t esp32_rmt_loop(mp_obj_t self_in, mp_obj_t loop) {
     esp32_rmt_obj_t *self = MP_OBJ_TO_PTR(self_in);
-    self->loop_en = mp_obj_get_int(loop);
+    if (self->pin == -1) {
+        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("already released"));
+    }
+
+    bool loop_en = mp_obj_get_int(loop);
+
+    if (self->enabled && self->loop_count == -1 && !loop_en && rmt_tx_wait_all_done(self->channel, 0) != ESP_OK) {
+        // Break ongoing loop
+        esp32_rmt_disable(self_in);
+    }
+
+    self->loop_count = loop_en ? -1 : 0;
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_2(esp32_rmt_loop_obj, esp32_rmt_loop);
 
+static mp_obj_t esp32_rmt_loop_count(mp_obj_t self_in, mp_obj_t loop) {
+    esp32_rmt_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    if (self->pin == -1) {
+        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("already released"));
+    }
+
+    int loop_count = mp_obj_get_int(loop);
+    if (loop_count < -1) {
+        mp_raise_ValueError(MP_ERROR_TEXT("arg must be -1, 0 or positive"));
+    }
+
+    if (self->enabled && self->loop_count != loop_count && rmt_tx_wait_all_done(self->channel, 0) != ESP_OK) {
+        // Break ongoing loop
+        esp32_rmt_disable(self_in);
+    }
+
+    self->loop_count = loop_count;
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_2(esp32_rmt_loop_count_obj, esp32_rmt_loop_count);
+
 static mp_obj_t esp32_rmt_write_pulses(size_t n_args, const mp_obj_t *args) {
     esp32_rmt_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    if (self->pin == -1) {
+        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("already released"));
+    }
 
-    rmt_tx_wait_all_done(self->channel, -1);
+    if (self->enabled) {
+        rmt_tx_wait_all_done(self->channel, -1);
+    } else {
+        check_esp_err(rmt_enable_core1(self->channel));
+        self->enabled = true;
+    }
 
     mp_obj_t duration_obj = args[1];
     mp_obj_t data_obj = n_args > 2 ? args[2] : mp_const_true;
@@ -288,11 +374,6 @@ static mp_obj_t esp32_rmt_write_pulses(size_t n_args, const mp_obj_t *args) {
     }
 
     mp_uint_t num_items = (num_pulses / 2) + (num_pulses % 2);
-    /*
-    if (num_items > self->num_symbols) {
-        mp_raise_ValueError(MP_ERROR_TEXT("Too many pulses for allocated num_symbols"));
-    }
-    */
 
     if (num_items > self->cap_items) {
         self->items = (rmt_symbol_word_t *)m_realloc(self->items, num_items * sizeof(rmt_symbol_word_t *));
@@ -313,12 +394,8 @@ static mp_obj_t esp32_rmt_write_pulses(size_t n_args, const mp_obj_t *args) {
         }
     }
 
-    /* TODO change loop_en to int, or create another property, to support a finite loop count */
-    /* TODO clarify if eot_level means the same as idle_level */
-    /* TODO add disable() or stop() method to call rmt_disable() to break an infinite loop w/o resorting to gc.collect() */
-
     rmt_transmit_config_t tx_config = {
-        .loop_count = self->loop_en ? -1 : 0,
+        .loop_count = self->loop_count,
         .flags.eot_level = self->idle_level ? 1 : 0,
     };
 
@@ -332,9 +409,12 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(esp32_rmt_write_pulses_obj, 2, 3, esp
 static const mp_rom_map_elem_t esp32_rmt_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR___del__), MP_ROM_PTR(&esp32_rmt_deinit_obj) },
     { MP_ROM_QSTR(MP_QSTR_deinit), MP_ROM_PTR(&esp32_rmt_deinit_obj) },
+    { MP_ROM_QSTR(MP_QSTR_release), MP_ROM_PTR(&esp32_rmt_release_obj) },
+    { MP_ROM_QSTR(MP_QSTR_disable), MP_ROM_PTR(&esp32_rmt_disable_obj) },
     { MP_ROM_QSTR(MP_QSTR_clock_div), MP_ROM_PTR(&esp32_rmt_clock_div_obj) },
     { MP_ROM_QSTR(MP_QSTR_wait_done), MP_ROM_PTR(&esp32_rmt_wait_done_obj) },
     { MP_ROM_QSTR(MP_QSTR_loop), MP_ROM_PTR(&esp32_rmt_loop_obj) },
+    { MP_ROM_QSTR(MP_QSTR_loop_count), MP_ROM_PTR(&esp32_rmt_loop_count_obj) },
     { MP_ROM_QSTR(MP_QSTR_write_pulses), MP_ROM_PTR(&esp32_rmt_write_pulses_obj) },
 
     // Class methods
@@ -351,5 +431,6 @@ MP_DEFINE_CONST_OBJ_TYPE(
     MP_TYPE_FLAG_NONE,
     make_new, esp32_rmt_make_new,
     print, esp32_rmt_print,
-    locals_dict, &esp32_rmt_locals_dict
+    locals_dict, &esp32_rmt_locals_dict,
+    protocol, &esp32_rmt_stream_p
     );

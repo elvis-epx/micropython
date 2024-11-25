@@ -253,7 +253,26 @@ For more details see Espressif's `ESP-IDF RMT documentation.
     Configure looping on the channel. *enable_loop* is bool, set to ``True`` to
     enable looping on the *next* call to `RMT.write_pulses`. If called with
     ``False`` while a looping sequence is currently being transmitted then the
-    current loop iteration will be completed and then transmission will stop.
+    transmission will stop. (Method deprecated by `RMT.loop_count`.)
+
+.. method:: RMT.loop_count(n)
+
+    Configure looping on the channel. *n* is int. Affects the *next* call to
+    `RMT.write_pulses`. Set to ``0`` to disable looping, ``-1`` to enable
+    infinite looping, or a positive number to loop for a given number of times.
+    If *n* is changed, the current transmission is stopped.
+
+.. method:: RMT.disable()
+
+    Disable RMT channel. This is useful to break an infinite transmission loop.
+    The object is not invaidated, and the RMT channel is again enabled when a new
+    tranmission is started.
+
+.. method:: RMT.release()
+
+    Release all RMT resources and invalidate the object. All subsequent method
+    calls will raise OSError. Useful to free RMT resources without having to wait
+    for the object to be garbage collected.
 
 .. method:: RMT.write_pulses(duration, data=True)
 

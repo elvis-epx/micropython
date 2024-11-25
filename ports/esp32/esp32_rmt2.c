@@ -55,28 +55,27 @@ typedef struct _esp32_rmt2_obj_t {
 
 #if MP_TASK_COREID == 0
 
-typedef struct _rmt_install_state_t {
+typedef struct _rmt_enable_state_t {
     SemaphoreHandle_t handle;
-    esp32_rmt2_obj_t* self;
+    rmt_channel_handle_t channel;
     esp_err_t ret;
-} rmt_install_state_t;
+} rmt_enable_state_t;
 
-static void start_rmt_rx_task(void *pvParameter) {
-    rmt_install_state_t *state = pvParameter;
-    esp32_rmt2_obj_t* self = state->self;
-    state->ret = rmt_receive(self->rx_channel, self->symbols, self->symbols_size, &self->rx_config);
+static void rmt_enable_task(void *pvParameter) {
+    rmt_enable_state_t *state = pvParameter;
+    state->ret = rmt_enable(state->channel);
     xSemaphoreGive(state->handle);
     vTaskDelete(NULL);
 }
 
-// Call rmt_driver_install on core 1.  This ensures that the RMT interrupt handler is
+// Call rmt_enable on core 1.  This ensures that the RMT interrupt handler is
 // serviced on core 1, so that WiFi (if active) does not interrupt it and cause glitches.
-esp_err_t start_rmt_rx_core1(esp32_rmt2_obj_t* self) {
+esp_err_t rmt_enable_core1(rmt_channel_handle_t channel) {
     TaskHandle_t th;
-    rmt_install_state_t state;
+    rmt_enable_state_t state;
     state.handle = xSemaphoreCreateBinary();
-    state.self = self;
-    xTaskCreatePinnedToCore(start_rmt_rx_task, "start_rmt_rx_task", 2048 / sizeof(StackType_t), &state, ESP_TASK_PRIO_MIN + 1, &th, 1);
+    state.channel = channel;
+    xTaskCreatePinnedToCore(rmt_enable_task, "rmt_enable_task", 2048 / sizeof(StackType_t), &state, ESP_TASK_PRIO_MIN + 1, &th, 1);
     xSemaphoreTake(state.handle, portMAX_DELAY);
     vSemaphoreDelete(state.handle);
     return state.ret;
@@ -86,8 +85,8 @@ esp_err_t start_rmt_rx_core1(esp32_rmt2_obj_t* self) {
 
 // MicroPython runs on core 1, so we can call the RMT installer directly and its
 // interrupt handler will also run on core 1.
-esp_err_t start_rmt_rx_core1(esp32_rmt2_obj_t* self) {
-    return rmt_receive(self->rx_channel, self->symbols, self->symbols_size, &self->rx_config);
+esp_err_t rmt_enable_core1(rmt_channel_handle_t channel) {
+    return rmt_enable(channel);
 }
 
 #endif
@@ -226,7 +225,7 @@ static mp_obj_t esp32_rmt2_make_new(const mp_obj_type_t *type, size_t n_args, si
         .on_recv_done = rmt_recv_done,
     };
     check_esp_err(rmt_rx_register_event_callbacks(self->rx_channel, &cbs, self));
-    check_esp_err(rmt_enable(self->rx_channel));
+    check_esp_err(rmt_enable_core1(self->channel));
 
     return MP_OBJ_FROM_PTR(self);
 }
@@ -279,7 +278,7 @@ static mp_obj_t esp32_rmt2_read_pulses(mp_obj_t self_in) {
     self->continue_rx = true;
     self->recv_available = false;
     self->recv_count = 0;
-    check_esp_err(start_rmt_rx_core1(self));
+    check_esp_err(rmt_receive(self->rx_channel, self->symbols, self->symbols_size, &self->rx_config));
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(esp32_rmt2_read_pulses_obj, esp32_rmt2_read_pulses);

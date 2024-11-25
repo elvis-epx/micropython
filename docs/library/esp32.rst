@@ -262,11 +262,17 @@ For more details see Espressif's `ESP-IDF RMT documentation.
     infinite looping, or a positive number to loop for a given number of times.
     If *n* is changed, the current transmission is stopped.
 
+    Note: looping for a finite number of times is not supported by all flavors
+    of ESP32.
+
 .. method:: RMT.disable()
 
     Disable RMT channel. This is useful to break an infinite transmission loop.
+    The current loop is finished and transmission stops.
     The object is not invaidated, and the RMT channel is again enabled when a new
-    tranmission is started.
+    tranmission is started
+
+    Note: panics if called during a non-looping transmission.
 
 .. method:: RMT.release()
 

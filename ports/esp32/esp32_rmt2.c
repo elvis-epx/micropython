@@ -225,7 +225,7 @@ static mp_obj_t esp32_rmt2_make_new(const mp_obj_type_t *type, size_t n_args, si
         .on_recv_done = rmt_recv_done,
     };
     check_esp_err(rmt_rx_register_event_callbacks(self->rx_channel, &cbs, self));
-    check_esp_err(rmt_enable_core1(self->channel));
+    check_esp_err(rmt_enable_core1(self->rx_channel));
 
     return MP_OBJ_FROM_PTR(self);
 }

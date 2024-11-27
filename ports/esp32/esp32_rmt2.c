@@ -13,7 +13,7 @@ Inspired by https://github.com/junkfix/esp32-rmt-rf-rx/blob/main/esp32-rmt-rf-rx
 import machine, esp32
 p = machine.Pin(14)
 
-r = esp32.RMT2(pin=p, buf=64, min_ns=3100, max_ns=5000000, resolution_hz=1000000)
+r = esp32.RMT2(pin=p, num_symbols=64, min_ns=3100, max_ns=5000000, resolution_hz=1000000)
 # optional params: soft_{min,max}_{len,value}
 r.read_pulses()
 r.get_data() # returns None if no data
@@ -139,7 +139,7 @@ static bool IRAM_ATTR rmt_recv_done(rmt_channel_handle_t channel, const rmt_rx_d
 static mp_obj_t esp32_rmt2_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *all_args) {
     static const mp_arg_t allowed_args[] = {
         { MP_QSTR_pin,           MP_ARG_REQUIRED | MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_obj = mp_const_none} },
-        { MP_QSTR_buf,                             MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 64} },
+        { MP_QSTR_num_symbols,                     MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 64} },
         { MP_QSTR_min_ns,        MP_ARG_REQUIRED | MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 0} },
         { MP_QSTR_max_ns,        MP_ARG_REQUIRED | MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 0} },
         { MP_QSTR_resolution_hz, MP_ARG_REQUIRED | MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 0} },
@@ -154,7 +154,7 @@ static mp_obj_t esp32_rmt2_make_new(const mp_obj_type_t *type, size_t n_args, si
     gpio_num_t pin_id = machine_pin_get_id(args[0].u_obj);
     int num_symbols = args[1].u_int;
     if ((num_symbols < 64) || ((num_symbols % 2) == 1)) {
-        mp_raise_ValueError(MP_ERROR_TEXT("buf must be at least 64 and even"));
+        mp_raise_ValueError(MP_ERROR_TEXT("num_symbols must be at least 64 and even"));
     }
 
     // RMT new driver does not have a way to specify a group clock divisor, see

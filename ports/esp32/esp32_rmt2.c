@@ -37,9 +37,7 @@ typedef struct _esp32_rmt2_obj_t {
     rmt_symbol_word_t *symbols;
     size_t symbols_size;
     size_t num_symbols;
-    // rmt_rx_done_event_data_t rx_data;
     rmt_receive_config_t rx_config;
-    rmt_rx_channel_config_t rx_ch_conf;
 
     // double buffering of received data
     bool recv_available;
@@ -215,12 +213,14 @@ static mp_obj_t esp32_rmt2_make_new(const mp_obj_type_t *type, size_t n_args, si
 
     self->rx_config.signal_range_min_ns = min_ns;
     self->rx_config.signal_range_max_ns = max_ns;
-    self->rx_ch_conf.gpio_num = self->pin = pin_id;
-    self->rx_ch_conf.clk_src = RMT_CLK_SRC_DEFAULT;
-    self->rx_ch_conf.resolution_hz = resolution_hz;
-    self->rx_ch_conf.mem_block_symbols = num_symbols;
 
-    check_esp_err(rmt_new_rx_channel(&self->rx_ch_conf, &self->rx_channel));
+    rmt_rx_channel_config_t rx_ch_conf;
+    rx_ch_conf.gpio_num = self->pin = pin_id;
+    rx_ch_conf.clk_src = RMT_CLK_SRC_DEFAULT;
+    rx_ch_conf.resolution_hz = resolution_hz;
+    rx_ch_conf.mem_block_symbols = num_symbols;
+
+    check_esp_err(rmt_new_rx_channel(&rx_ch_conf, &self->rx_channel));
     rmt_rx_event_callbacks_t cbs = {
         .on_recv_done = rmt_recv_done,
     };
@@ -232,10 +232,9 @@ static mp_obj_t esp32_rmt2_make_new(const mp_obj_type_t *type, size_t n_args, si
 
 static void esp32_rmt2_print(const mp_print_t *print, mp_obj_t self_in, mp_print_kind_t kind) {
     esp32_rmt2_obj_t *self = MP_OBJ_TO_PTR(self_in);
-    mp_printf(print, "RMT2 pin=%u buf=%u(x2) min_ns=%u max_ns=%u,resolution_hz=%u, last_recv=%u",
+    mp_printf(print, "RMT2 pin=%u buf=%u(x2) min_ns=%u max_ns=%u",
                     self->pin, self->num_symbols,
-                    self->rx_config.signal_range_min_ns, self->rx_config.signal_range_max_ns,
-                    self->rx_ch_conf.resolution_hz);
+                    self->rx_config.signal_range_min_ns, self->rx_config.signal_range_max_ns);
 }
 
 

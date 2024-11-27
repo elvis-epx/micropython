@@ -215,11 +215,14 @@ static mp_obj_t esp32_rmt2_make_new(const mp_obj_type_t *type, size_t n_args, si
     self->rx_config.signal_range_min_ns = min_ns;
     self->rx_config.signal_range_max_ns = max_ns;
 
-    rmt_rx_channel_config_t rx_ch_conf;
-    rx_ch_conf.gpio_num = self->pin = pin_id;
-    rx_ch_conf.clk_src = RMT_CLK_SRC_DEFAULT;
-    rx_ch_conf.resolution_hz = resolution_hz;
-    rx_ch_conf.mem_block_symbols = num_symbols;
+    self->pin = pin_id;
+
+    rmt_rx_channel_config_t rx_ch_conf = {
+        .gpio_num = self->pin = pin_id,
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .resolution_hz = resolution_hz,
+        .mem_block_symbols = num_symbols,
+    };
 
     check_esp_err(rmt_new_rx_channel(&rx_ch_conf, &self->channel));
     rmt_rx_event_callbacks_t cbs = {

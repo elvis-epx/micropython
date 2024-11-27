@@ -31,9 +31,12 @@ extern const mp_obj_type_t esp32_rmt2_type;
 // Python object impl structure
 typedef struct _esp32_rmt2_obj_t {
     mp_obj_base_t base;
+    rmt_channel_handle_t channel;
+    // bool enabled
     gpio_num_t pin;
+
+    // RX-only members
     bool continue_rx;
-    rmt_channel_handle_t rx_channel;
     rmt_symbol_word_t *symbols;
     size_t symbols_size;
     size_t num_symbols;
@@ -128,7 +131,7 @@ static bool IRAM_ATTR rmt_recv_done(rmt_channel_handle_t channel, const rmt_rx_d
     }
 
     if (self->continue_rx) {
-        rmt_receive(self->rx_channel, self->symbols, self->symbols_size, &self->rx_config);
+        rmt_receive(self->channel, self->symbols, self->symbols_size, &self->rx_config);
     }
 
     return false;
@@ -199,7 +202,7 @@ static mp_obj_t esp32_rmt2_make_new(const mp_obj_type_t *type, size_t n_args, si
 
     esp32_rmt2_obj_t *self = mp_obj_malloc_with_finaliser(esp32_rmt2_obj_t, &esp32_rmt2_type);
 
-    self->rx_channel = NULL;
+    self->channel = NULL;
     self->num_symbols = num_symbols;
     self->symbols_size = num_symbols * sizeof(rmt_symbol_word_t);
     self->symbols = m_realloc(NULL, self->symbols_size);
@@ -220,12 +223,12 @@ static mp_obj_t esp32_rmt2_make_new(const mp_obj_type_t *type, size_t n_args, si
     rx_ch_conf.resolution_hz = resolution_hz;
     rx_ch_conf.mem_block_symbols = num_symbols;
 
-    check_esp_err(rmt_new_rx_channel(&rx_ch_conf, &self->rx_channel));
+    check_esp_err(rmt_new_rx_channel(&rx_ch_conf, &self->channel));
     rmt_rx_event_callbacks_t cbs = {
         .on_recv_done = rmt_recv_done,
     };
-    check_esp_err(rmt_rx_register_event_callbacks(self->rx_channel, &cbs, self));
-    check_esp_err(rmt_enable_core1(self->rx_channel));
+    check_esp_err(rmt_rx_register_event_callbacks(self->channel, &cbs, self));
+    check_esp_err(rmt_enable_core1(self->channel));
 
     return MP_OBJ_FROM_PTR(self);
 }
@@ -242,8 +245,8 @@ static mp_obj_t esp32_rmt2_deinit(mp_obj_t self_in) {
     esp32_rmt2_obj_t *self = MP_OBJ_TO_PTR(self_in);
 
     if (self->pin != -1) { // Check if channel has already been deinitialised.
-        rmt_disable(self->rx_channel);
-        rmt_del_channel(self->rx_channel);
+        rmt_disable(self->channel);
+        rmt_del_channel(self->channel);
         self->pin = -1;
     }
     m_free(self->symbols);
@@ -277,7 +280,7 @@ static mp_obj_t esp32_rmt2_read_pulses(mp_obj_t self_in) {
     self->continue_rx = true;
     self->recv_available = false;
     self->recv_count = 0;
-    check_esp_err(rmt_receive(self->rx_channel, self->symbols, self->symbols_size, &self->rx_config));
+    check_esp_err(rmt_receive(self->channel, self->symbols, self->symbols_size, &self->rx_config));
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(esp32_rmt2_read_pulses_obj, esp32_rmt2_read_pulses);

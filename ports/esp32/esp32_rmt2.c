@@ -39,7 +39,6 @@ typedef struct _esp32_rmt2_obj_t {
     bool continue_rx;
     rmt_symbol_word_t *symbols;
     size_t symbols_size;
-    size_t num_symbols;
     rmt_receive_config_t rx_config;
 
     // double buffering of received data
@@ -203,10 +202,9 @@ static mp_obj_t esp32_rmt2_make_new(const mp_obj_type_t *type, size_t n_args, si
     esp32_rmt2_obj_t *self = mp_obj_malloc_with_finaliser(esp32_rmt2_obj_t, &esp32_rmt2_type);
 
     self->channel = NULL;
-    self->num_symbols = num_symbols;
     self->symbols_size = num_symbols * sizeof(rmt_symbol_word_t);
     self->symbols = m_realloc(NULL, self->symbols_size);
-    self->recv_data = m_realloc(NULL, self->symbols_size * 2 * sizeof(int));
+    self->recv_data = m_realloc(NULL, num_symbols * 2 * sizeof(int));
     self->recv_count = 0;
     self->recv_available = false;
     self->soft_min_len = soft_min_len;
@@ -235,9 +233,8 @@ static mp_obj_t esp32_rmt2_make_new(const mp_obj_type_t *type, size_t n_args, si
 
 static void esp32_rmt2_print(const mp_print_t *print, mp_obj_t self_in, mp_print_kind_t kind) {
     esp32_rmt2_obj_t *self = MP_OBJ_TO_PTR(self_in);
-    mp_printf(print, "RMT2 pin=%u buf=%u(x2) min_ns=%u max_ns=%u",
-                    self->pin, self->num_symbols,
-                    self->rx_config.signal_range_min_ns, self->rx_config.signal_range_max_ns);
+    mp_printf(print, "RMT2 pin=%u min_ns=%u max_ns=%u",
+                    self->pin, self->rx_config.signal_range_min_ns, self->rx_config.signal_range_max_ns);
 }
 
 

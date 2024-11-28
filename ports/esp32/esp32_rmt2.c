@@ -42,7 +42,6 @@ typedef struct _esp32_rmt2_obj_t {
     rmt_receive_config_t rx_config;
 
     // double buffering of received data
-    bool recv_available;
     size_t recv_count;
     int *recv_data;
 
@@ -95,7 +94,7 @@ esp_err_t rmt_enable_core1(rmt_channel_handle_t channel) {
 static bool IRAM_ATTR rmt_recv_done(rmt_channel_handle_t channel, const rmt_rx_done_event_data_t *edata, void *udata){
     esp32_rmt2_obj_t *self = udata;
 
-    if (!self->recv_available) {
+    if (!self->recv_count) {
         const rmt_symbol_word_t *data = edata->received_symbols;
         size_t len = edata->num_symbols;
         int odd = (data[len - 1].duration1 == 0) ? 1 : 0;
@@ -123,9 +122,6 @@ static bool IRAM_ATTR rmt_recv_done(rmt_channel_handle_t channel, const rmt_rx_d
             }
             
             self->recv_count = list_len;
-            if (list_len > 0) {
-                self->recv_available = true;
-            }
         }
     }
 
@@ -206,7 +202,6 @@ static mp_obj_t esp32_rmt2_make_new(const mp_obj_type_t *type, size_t n_args, si
     self->items = m_realloc(NULL, num_symbols * sizeof(rmt_symbol_word_t));
     self->recv_data = m_realloc(NULL, num_symbols * 2 * sizeof(int));
     self->recv_count = 0;
-    self->recv_available = false;
     self->soft_min_len = soft_min_len;
     self->soft_max_len = soft_max_len;
     self->soft_min_value = soft_min_value;
@@ -254,7 +249,6 @@ static mp_obj_t esp32_rmt2_deinit(mp_obj_t self_in) {
     m_free(self->recv_data);
     self->recv_data = 0;
     self->recv_count = 0;
-    self->recv_available = false;
     self->rx_active = false;
 
     return mp_const_none;
@@ -267,7 +261,6 @@ static mp_obj_t esp32_rmt2_stop_read_pulses(mp_obj_t self_in) {
 
     bool ret = self->rx_active;
     self->rx_active = false;
-    self->recv_available = false;
     self->recv_count = 0;
     return ret ? mp_const_true : mp_const_false;
 }
@@ -278,7 +271,6 @@ static mp_obj_t esp32_rmt2_read_pulses(mp_obj_t self_in) {
     esp32_rmt2_obj_t *self = MP_OBJ_TO_PTR(self_in);
 
     self->rx_active = true;
-    self->recv_available = false;
     self->recv_count = 0;
     check_esp_err(rmt_receive(self->channel, self->items, self->cap_items * sizeof(rmt_symbol_word_t), &self->rx_config));
     return mp_const_none;
@@ -289,7 +281,7 @@ static MP_DEFINE_CONST_FUN_OBJ_1(esp32_rmt2_read_pulses_obj, esp32_rmt2_read_pul
 static mp_obj_t esp32_rmt2_get_data(mp_obj_t self_in) {
     esp32_rmt2_obj_t *self = MP_OBJ_TO_PTR(self_in);
 
-    if (! self->recv_available) {
+    if (!self->recv_count) {
         return mp_const_none;
     }
 
@@ -300,7 +292,7 @@ static mp_obj_t esp32_rmt2_get_data(mp_obj_t self_in) {
         list_in->items[i] = mp_obj_new_int(self->recv_data[i]);
     }
 
-    self->recv_available = false;
+    self->recv_count = 0;
 
     return list;
 }
@@ -327,7 +319,7 @@ static mp_uint_t esp32_rmt2_stream_ioctl(
     esp32_rmt2_obj_t *self = MP_OBJ_TO_PTR(self_in);
     return arg ^ (
                // If no data in the buffer, unset the Read ready flag
-               (self->recv_available ? 0 : MP_STREAM_POLL_RD));
+               (self->recv_count ? 0 : MP_STREAM_POLL_RD));
 }
 
 static const mp_stream_p_t esp32_rmt2_stream_p = {

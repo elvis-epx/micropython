@@ -40,11 +40,9 @@ typedef struct _esp32_rmt2_obj_t {
     // RX-only members
     bool rx_active;
     rmt_receive_config_t rx_config;
-
     // double buffering of received data
     size_t recv_count;
     int *recv_data;
-
     // soft filtering values
     int soft_min_len;
     int soft_max_len;
@@ -94,37 +92,42 @@ esp_err_t rmt_enable_core1(rmt_channel_handle_t channel) {
 static bool IRAM_ATTR rmt_recv_done(rmt_channel_handle_t channel, const rmt_rx_done_event_data_t *edata, void *udata){
     esp32_rmt2_obj_t *self = udata;
 
-    if (!self->recv_count) {
-        const rmt_symbol_word_t *data = edata->received_symbols;
-        size_t len = edata->num_symbols;
-        int odd = (data[len - 1].duration1 == 0) ? 1 : 0;
-        int list_len = len * 2 - odd;
-
-        if (list_len >= self->soft_min_len && list_len <= self->soft_max_len) {
-            for (uint8_t i = 0; i < len; i++) {
-                int n0 = (uint16_t) data[i].duration0;
-                if (n0 < self->soft_min_value || n0 > self->soft_max_value) {
-                    list_len = 0;
-                    break;
-                }
-                self->recv_data[i * 2 + 0] = n0 * (data[i].level0 ? +1 : -1);
-
-                if (odd && i == (len - 1)) {
-                    continue;
-                }
-
-                int n1 = (uint16_t) data[i].duration1;
-                if (n1 < self->soft_min_value || n1 > self->soft_max_value) {
-                    list_len = 0;
-                    break;
-                }
-                self->recv_data[i * 2 + 1] = n1 * (data[i].level1 ? +1 : -1);
-            }
-            
-            self->recv_count = list_len;
-        }
+    if (self->recv_count) {
+        // user hasn't read the last reception yet
+        goto out;
     }
 
+    const rmt_symbol_word_t *data = edata->received_symbols;
+    size_t len = edata->num_symbols;
+    int odd = (data[len - 1].duration1 == 0) ? 1 : 0;
+    int list_len = len * 2 - odd;
+
+    if (list_len < self->soft_min_len || list_len > self->soft_max_len) {
+        goto out;
+    }
+
+    for (size_t i = 0; i < len; i++) {
+        int n0 = (uint16_t) data[i].duration0;
+        if (n0 < self->soft_min_value || n0 > self->soft_max_value) {
+            goto out;
+        }
+        self->recv_data[i * 2 + 0] = n0 * (data[i].level0 ? +1 : -1);
+
+        if (odd && i == (len - 1)) {
+            continue;
+        }
+
+        int n1 = (uint16_t) data[i].duration1;
+        if (n1 < self->soft_min_value || n1 > self->soft_max_value) {
+            goto out;
+        }
+        self->recv_data[i * 2 + 1] = n1 * (data[i].level1 ? +1 : -1);
+    }
+
+    // commit the reception
+    self->recv_count = list_len;
+
+out:
     if (self->rx_active) {
         rmt_receive(self->channel, self->items, self->cap_items * sizeof(rmt_symbol_word_t), &self->rx_config);
     }
@@ -288,7 +291,7 @@ static mp_obj_t esp32_rmt2_get_data(mp_obj_t self_in) {
     mp_obj_t list = mp_obj_new_list(self->recv_count, NULL);
     mp_obj_list_t *list_in = MP_OBJ_TO_PTR(list);
 
-    for (uint8_t i = 0; i < self->recv_count; i++) {
+    for (size_t i = 0; i < self->recv_count; i++) {
         list_in->items[i] = mp_obj_new_int(self->recv_data[i]);
     }
 

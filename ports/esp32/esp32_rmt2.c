@@ -38,7 +38,7 @@ typedef struct _esp32_rmt2_obj_t {
     rmt_symbol_word_t *items;
 
     // RX-only members
-    bool continue_rx;
+    bool rx_active;
     rmt_receive_config_t rx_config;
 
     // double buffering of received data
@@ -129,7 +129,7 @@ static bool IRAM_ATTR rmt_recv_done(rmt_channel_handle_t channel, const rmt_rx_d
         }
     }
 
-    if (self->continue_rx) {
+    if (self->rx_active) {
         rmt_receive(self->channel, self->items, self->cap_items * sizeof(rmt_symbol_word_t), &self->rx_config);
     }
 
@@ -255,7 +255,7 @@ static mp_obj_t esp32_rmt2_deinit(mp_obj_t self_in) {
     self->recv_data = 0;
     self->recv_count = 0;
     self->recv_available = false;
-    self->continue_rx = false;
+    self->rx_active = false;
 
     return mp_const_none;
 }
@@ -265,8 +265,8 @@ static MP_DEFINE_CONST_FUN_OBJ_1(esp32_rmt2_deinit_obj, esp32_rmt2_deinit);
 static mp_obj_t esp32_rmt2_stop_read_pulses(mp_obj_t self_in) {
     esp32_rmt2_obj_t *self = MP_OBJ_TO_PTR(self_in);
 
-    bool ret = self->continue_rx;
-    self->continue_rx = false;
+    bool ret = self->rx_active;
+    self->rx_active = false;
     self->recv_available = false;
     self->recv_count = 0;
     return ret ? mp_const_true : mp_const_false;
@@ -277,7 +277,7 @@ static MP_DEFINE_CONST_FUN_OBJ_1(esp32_rmt2_stop_read_pulses_obj, esp32_rmt2_sto
 static mp_obj_t esp32_rmt2_read_pulses(mp_obj_t self_in) {
     esp32_rmt2_obj_t *self = MP_OBJ_TO_PTR(self_in);
 
-    self->continue_rx = true;
+    self->rx_active = true;
     self->recv_available = false;
     self->recv_count = 0;
     check_esp_err(rmt_receive(self->channel, self->items, self->cap_items * sizeof(rmt_symbol_word_t), &self->rx_config));
